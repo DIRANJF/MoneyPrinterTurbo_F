@@ -481,6 +481,282 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = "", custom_bgm_file: 
     return ""
 
 
+def combine_videos_with_materials(
+    combined_video_path: str,
+    video_materials: List[MaterialInfo],
+    audio_file: str = None,
+    video_aspect: VideoAspect = VideoAspect.portrait_9_16,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: int = 5,
+    threads: int = 2,
+) -> str:
+    logger.info(f"Starting combine_videos_with_materials, output_path: {combined_video_path}")
+    logger.info(f"audio_file provided: {audio_file is not None}")
+    
+    # 判断是否有素材需要使用原音频
+    has_original_audio = any(getattr(m, "use_original_audio", False) for m in video_materials)
+    logger.info(f"has_original_audio: {has_original_audio}")
+    
+    # 计算音频时长 - 优先使用 audio_file，如果没有则根据素材时长计算
+    audio_duration = 0
+    try:
+        if audio_file:
+            audio_clip = AudioFileClip(audio_file)
+            try:
+                audio_duration = audio_clip.duration
+            finally:
+                close_clip(audio_clip)
+            logger.info(f"audio duration from audio_file: {audio_duration} seconds")
+        else:
+            # 如果没有 audio_file，根据素材的总时长来计算
+            for material in video_materials:
+                video_path = material.url
+                clip = _open_video_clip_quietly(video_path)
+                clip_duration = clip.duration
+                close_clip(clip)
+                # 如果使用自定义切片，使用自定义时长
+                if getattr(material, "use_custom_clip", False):
+                    start_time = material.start_time
+                    end_time = material.end_time
+                    if end_time > start_time:
+                        audio_duration += (end_time - start_time)
+                    else:
+                        audio_duration += clip_duration
+                else:
+                    audio_duration += clip_duration
+            logger.info(f"audio duration calculated from materials: {audio_duration} seconds")
+    except Exception as e:
+        logger.error(f"Error calculating audio duration: {str(e)}", exc_info=True)
+        raise
+    
+    logger.info(f"maximum clip duration: {max_clip_duration} seconds")
+
+    # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    output_dir = os.path.dirname(combined_video_path)
+
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+
+    processed_clips = []
+    subclipped_items = []
+    video_duration = 0
+    # 保存每个素材的 use_original_audio 信息
+    material_audio_info = {}
+    for material in video_materials:
+        video_path = material.url
+        clip = _open_video_clip_quietly(video_path)
+        clip_duration = clip.duration
+        clip_w, clip_h = clip.size
+        close_clip(clip)
+        
+        # 保存素材的 use_original_audio 信息
+        material_audio_info[video_path] = getattr(material, "use_original_audio", False)
+        
+        # 使用 material 中设置的 start_time 和 end_time
+        start_time = material.start_time
+        end_time = material.end_time
+        
+        # 检查 material 是否有 use_custom_clip 字段
+        use_custom_clip = getattr(material, "use_custom_clip", False)
+        
+        # 如果使用自定义切片
+        if use_custom_clip:
+            # 如果没有设置 end_time 或 end_time 为 0，则使用整个视频
+            if end_time == 0 or end_time >= clip_duration:
+                end_time = clip_duration
+            
+            # 确保 start_time 和 end_time 是有效的
+            start_time = max(0, min(start_time, clip_duration))
+            end_time = max(start_time + 0.1, min(end_time, clip_duration))
+            
+            logger.info(f"Using custom clip: {os.path.basename(video_path)} from {start_time:.2f}s to {end_time:.2f}s")
+            subclipped_items.append(
+                SubClippedVideoClip(
+                    file_path=video_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    width=clip_w,
+                    height=clip_h,
+                    source_file_path=video_path,
+                )
+            )
+        else:
+            # 使用视频片段时长自动切片
+            current_start = 0
+            while current_start < clip_duration:
+                current_end = min(current_start + max_clip_duration, clip_duration)
+                if current_end > current_start:
+                    subclipped_items.append(
+                        SubClippedVideoClip(
+                            file_path=video_path,
+                            start_time=current_start,
+                            end_time=current_end,
+                            width=clip_w,
+                            height=clip_h,
+                            source_file_path=video_path,
+                        )
+                    )
+                current_start = current_end
+                if video_concat_mode.value == VideoConcatMode.sequential.value:
+                    break
+
+    subclipped_items = _prioritize_unique_source_clips(
+        subclipped_items=subclipped_items,
+        concat_mode=video_concat_mode,
+    )
+        
+    logger.debug(f"total subclipped items: {len(subclipped_items)}")
+    
+    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
+    for i, subclipped_item in enumerate(subclipped_items):
+        if audio_duration > 0 and video_duration >= audio_duration:
+            break
+        
+        logger.debug(
+            f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
+            f"source: {os.path.basename(subclipped_item.source_file_path)}, "
+            f"current duration: {video_duration:.2f}s, "
+            f"remaining: {audio_duration - video_duration:.2f}s"
+        )
+        
+        try:
+            # 如果是 combine_videos_with_materials 函数且有 material_audio_info，根据需要打开音频
+            if 'material_audio_info' in locals():
+                source_file = subclipped_item.source_file_path
+                use_audio = material_audio_info.get(source_file, False)
+                clip = VideoFileClip(subclipped_item.file_path, audio=use_audio).subclipped(
+                    subclipped_item.start_time, subclipped_item.end_time
+                )
+            else:
+                clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
+                    subclipped_item.start_time, subclipped_item.end_time
+                )
+            clip_duration = clip.duration
+            # Not all videos are same size, so we need to resize them
+            clip_w, clip_h = clip.size
+            if clip_w != video_width or clip_h != video_height:
+                clip_ratio = clip.w / clip.h
+                video_ratio = video_width / video_height
+                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
+                
+                if clip_ratio == video_ratio:
+                    clip = clip.resized(new_size=(video_width, video_height))
+                else:
+                    if clip_ratio > video_ratio:
+                        scale_factor = video_width / clip_w
+                    else:
+                        scale_factor = video_height / clip_h
+
+                    new_width = int(clip_w * scale_factor)
+                    new_height = int(clip_h * scale_factor)
+
+                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
+                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+                    clip = CompositeVideoClip([background, clip_resized])
+                    
+            shuffle_side = random.choice(["left", "right", "top", "bottom"])
+            if transition_value in (None, VideoTransitionMode.none.value):
+                clip = clip
+            elif transition_value == VideoTransitionMode.fade_in.value:
+                clip = video_effects.fadein_transition(clip, 1)
+            elif transition_value == VideoTransitionMode.fade_out.value:
+                clip = video_effects.fadeout_transition(clip, 1)
+            elif transition_value == VideoTransitionMode.slide_in.value:
+                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+            elif transition_value == VideoTransitionMode.slide_out.value:
+                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+            elif transition_value == VideoTransitionMode.shuffle.value:
+                transition_funcs = [
+                    lambda c: video_effects.fadein_transition(c, 1),
+                    lambda c: video_effects.fadeout_transition(c, 1),
+                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                ]
+                shuffle_transition = random.choice(transition_funcs)
+                clip = shuffle_transition(clip)
+
+            if clip.duration > max_clip_duration:
+                clip = clip.subclipped(0, max_clip_duration)
+                
+            # wirte clip to temp file
+            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            
+            # 准备写入参数
+            write_params = {
+                "filename": clip_file,
+                "logger": None,
+                "fps": fps,
+                "codec": video_codec,
+                "bitrate": video_bitrate,
+                "preset": video_preset,
+                "ffmpeg_params": ["-crf", str(video_crf), "-pix_fmt", video_pix_fmt]
+            }
+            
+            # 如果是 combine_videos_with_materials 函数且有 material_audio_info
+            if 'material_audio_info' in locals():
+                source_file = subclipped_item.source_file_path
+                use_audio = material_audio_info.get(source_file, False)
+                if not use_audio:
+                    write_params["audio"] = False
+            
+            clip.write_videofile(**write_params)
+
+            # Store clip duration before closing
+            clip_duration_saved = clip.duration
+            close_clip(clip)
+
+            processed_clips.append(
+                SubClippedVideoClip(
+                    file_path=clip_file,
+                    duration=clip_duration_saved,
+                    width=clip_w,
+                    height=clip_h,
+                    source_file_path=subclipped_item.source_file_path,
+                )
+            )
+            video_duration += clip_duration_saved
+            
+        except Exception as e:
+            logger.error(f"failed to process clip: {str(e)}")
+    
+    # loop processed clips until the video duration matches or exceeds the audio duration.
+    if audio_duration > 0 and video_duration < audio_duration:
+        logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
+        base_clips = processed_clips.copy()
+        for clip in itertools.cycle(base_clips):
+            if video_duration >= audio_duration:
+                break
+            processed_clips.append(clip)
+            video_duration += clip.duration
+
+    # 组合视频并写入输出
+    clip_files = [clip.file_path for clip in processed_clips]
+    if not clip_files:
+        raise ValueError("no valid clips to combine")
+    
+    logger.info(f"combining {len(clip_files)} clips into final video")
+    logger.info(f"Clip files: {clip_files}")
+    
+    # 检查临时 clip 文件是否存在
+    for clip_file in clip_files:
+        if not os.path.exists(clip_file):
+            logger.error(f"Temp clip file not found: {clip_file}")
+    
+    concat_video_clips_with_ffmpeg(clip_files, combined_video_path, threads, output_dir)
+    
+    # 验证输出文件
+    if os.path.exists(combined_video_path):
+        file_size = os.path.getsize(combined_video_path)
+        logger.success(f"Combined video successfully created: {combined_video_path} ({file_size} bytes)")
+    else:
+        logger.error(f"Combined video file not found: {combined_video_path}")
+        raise FileNotFoundError(f"Combined video file not found: {combined_video_path}")
+    
+    return combined_video_path
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -561,9 +837,17 @@ def combine_videos(
         )
         
         try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
-            )
+            # 如果是 combine_videos_with_materials 函数且有 material_audio_info，根据需要打开音频
+            if 'material_audio_info' in locals():
+                source_file = subclipped_item.source_file_path
+                use_audio = material_audio_info.get(source_file, False)
+                clip = VideoFileClip(subclipped_item.file_path, audio=use_audio).subclipped(
+                    subclipped_item.start_time, subclipped_item.end_time
+                )
+            else:
+                clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
+                    subclipped_item.start_time, subclipped_item.end_time
+                )
             clip_duration = clip.duration
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
@@ -613,15 +897,26 @@ def combine_videos(
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            clip.write_videofile(
-                clip_file, 
-                logger=None, 
-                fps=fps, 
-                codec=video_codec,
-                bitrate=video_bitrate,
-                preset=video_preset,
-                ffmpeg_params=["-crf", str(video_crf), "-pix_fmt", video_pix_fmt]
-            )
+            
+            # 准备写入参数
+            write_params = {
+                "filename": clip_file,
+                "logger": None,
+                "fps": fps,
+                "codec": video_codec,
+                "bitrate": video_bitrate,
+                "preset": video_preset,
+                "ffmpeg_params": ["-crf", str(video_crf), "-pix_fmt", video_pix_fmt]
+            }
+            
+            # 如果是 combine_videos_with_materials 函数且有 material_audio_info
+            if 'material_audio_info' in locals():
+                source_file = subclipped_item.source_file_path
+                use_audio = material_audio_info.get(source_file, False)
+                if not use_audio:
+                    write_params["audio"] = False
+            
+            clip.write_videofile(**write_params)
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
@@ -642,7 +937,7 @@ def combine_videos(
             logger.error(f"failed to process clip: {str(e)}")
     
     # loop processed clips until the video duration matches or exceeds the audio duration.
-    if video_duration < audio_duration:
+    if audio_duration > 0 and video_duration < audio_duration:
         logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
         base_clips = processed_clips.copy()
         for clip in itertools.cycle(base_clips):
@@ -1031,9 +1326,13 @@ def generate_video(
         return _clip
 
     video_clip = _open_video_clip_quietly(video_path)
-    audio_clip = AudioFileClip(audio_path).with_effects(
-        [afx.MultiplyVolume(params.voice_volume)]
-    )
+    
+    # 如果 audio_path 为 None，就不处理音频，也不添加生成的音频和 BGM
+    audio_clip = None
+    if audio_path:
+        audio_clip = AudioFileClip(audio_path).with_effects(
+            [afx.MultiplyVolume(params.voice_volume)]
+        )
 
     def make_textclip(text):
         return TextClip(
@@ -1071,7 +1370,7 @@ def generate_video(
             logger.error(f"Error processing subtitles: {e}")
 
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file, custom_bgm_file=getattr(params, "custom_bgm_file", ""))
-    if bgm_file:
+    if bgm_file and audio_clip:
         try:
             bgm_clip = AudioFileClip(bgm_file).with_effects(
                 [
@@ -1084,24 +1383,36 @@ def generate_video(
         except Exception as e:
             logger.error(f"failed to add bgm: {str(e)}")
 
-    video_clip = video_clip.with_audio(audio_clip)
+    if audio_clip:
+        video_clip = video_clip.with_audio(audio_clip)
     # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
     # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-    video_clip.write_videofile(
-        output_file,
-        audio_codec=audio_codec,
-        audio_fps=output_audio_fps,
-        audio_bitrate=audio_bitrate,
-        temp_audiofile_path=output_dir,
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-        codec=video_codec,
-        bitrate=bitrate,
-        preset=preset_name,
-        ffmpeg_params=["-crf", str(crf), "-pix_fmt", video_pix_fmt]
-    )
+    if audio_clip:
+        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+    else:
+        output_audio_fps = 44100
+    # 准备写入视频的参数
+    write_params = {
+        "filename": output_file,
+        "audio_fps": output_audio_fps,
+        "audio_bitrate": audio_bitrate,
+        "temp_audiofile_path": output_dir,
+        "threads": params.n_threads or 2,
+        "logger": None,
+        "fps": fps,
+        "codec": video_codec,
+        "bitrate": bitrate,
+        "preset": preset_name,
+        "ffmpeg_params": ["-crf", str(crf), "-pix_fmt", video_pix_fmt]
+    }
+    
+    # 如果有 audio_clip，添加音频相关参数
+    if audio_clip:
+        write_params["audio_codec"] = audio_codec
+    else:
+        write_params["audio"] = False
+    
+    video_clip.write_videofile(**write_params)
     video_clip.close()
     del video_clip
 
@@ -1114,24 +1425,58 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
     local_videos_dir = utils.storage_dir("local_videos", create=True)
+    temp_dir = utils.storage_dir("temp", create=True)
+    
+    logger.info(f"Starting preprocess_video, {len(materials)} materials to process")
+    logger.info(f"local_videos_dir: {local_videos_dir}")
+    logger.info(f"temp_dir: {temp_dir}")
 
     for material in materials:
         if not material.url:
+            logger.warning("Skipping material with empty url")
             continue
+        
+        logger.info(f"Processing material: {material.url}")
 
-        try:
-            material_source_path = file_security.resolve_path_within_directory(
-                local_videos_dir, material.url
-            )
-        except ValueError as exc:
-            # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
-            # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
-            # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
-            logger.warning(
-                f"skip unsafe local material: {material.url}, "
-                f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
-            )
-            continue
+        # 简化验证：如果路径存在且在允许的目录内，直接使用
+        material_source_path = None
+        if os.path.isabs(material.url) and os.path.exists(material.url):
+            # 检查是否在 temp_dir 或 local_videos_dir 下（包括子目录）
+            real_path = os.path.realpath(material.url)
+            temp_real = os.path.realpath(temp_dir)
+            local_real = os.path.realpath(local_videos_dir)
+            
+            in_temp = real_path.startswith(temp_real + os.path.sep) or real_path == temp_real
+            in_local = real_path.startswith(local_real + os.path.sep) or real_path == local_real
+            
+            if in_temp or in_local:
+                material_source_path = real_path
+                logger.info(f"Using verified path: {material_source_path}")
+            else:
+                logger.warning(f"Path not in allowed directories: {real_path}")
+                logger.warning(f"Allowed directories: temp={temp_real}, local={local_real}")
+                continue
+        else:
+            # 尝试在允许的目录中查找
+            found = False
+            for base_dir in [temp_dir, local_videos_dir]:
+                try:
+                    material_source_path = file_security.resolve_path_within_directory(
+                        base_dir, material.url
+                    )
+                    logger.info(f"Found in {base_dir}: {material_source_path}")
+                    found = True
+                    break
+                except ValueError:
+                    continue
+            
+            if not found:
+                logger.warning(f"Could not find material: {material.url}")
+                continue
+        
+        # 更新 material 的 url 为验证后的路径
+        material.url = material_source_path
+        logger.info(f"Material url updated to: {material.url}")
 
         ext = utils.parse_extension(material_source_path)
         try:
@@ -1181,7 +1526,9 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
             raise
 
         valid_materials.append(material)
+        logger.info(f"Material added to valid list: {material.url}")
 
+    logger.success(f"preprocess_video completed, {len(valid_materials)}/{len(materials)} materials valid")
     return valid_materials
 
 

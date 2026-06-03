@@ -25,6 +25,18 @@ from app.utils import utils
 from loguru import logger
 
 
+# 自定义 log handler，用于将 logger 输出记录到 st.session_state
+class StreamlitLogHandler:
+    def write(self, message):
+        # 去掉换行符等
+        msg = message.strip()
+        if msg and "log_records" in st.session_state:
+            st.session_state["log_records"].append(msg)
+    
+    def flush(self):
+        pass
+
+
 # 页面配置
 st.set_page_config(
     page_title="视频合成器",
@@ -418,8 +430,170 @@ with col1:
                 type=["mp4", "mov", "avi", "mkv", "jpg", "jpeg", "png"],
                 accept_multiple_files=True
             )
+            
             if uploaded_files:
                 st.success(f"已上传 {len(uploaded_files)} 个素材文件")
+                
+                # 保存上传的文件到临时目录
+                temp_material_dir = os.path.join("storage", "temp", "material_preview")
+                os.makedirs(temp_material_dir, exist_ok=True)
+                
+                # 为每个素材创建配置
+                material_configs = []
+                for idx, uploaded_file in enumerate(uploaded_files):
+                    # 创建一个分隔的容器来放置每个素材
+                    with st.container():
+                        st.markdown(f"**素材 {idx+1}: {uploaded_file.name}**")
+                        
+                        # 保存文件
+                        file_path = os.path.join(temp_material_dir, uploaded_file.name)
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getvalue())
+                        
+                        # 检测文件类型
+                        is_video = uploaded_file.name.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))
+                        
+                        if is_video:
+                            try:
+                                from moviepy.video.io.VideoFileClip import VideoFileClip
+                                clip = VideoFileClip(file_path)
+                                total_duration = clip.duration
+                                clip.close()
+                                
+                                st.markdown(f"总时长: {total_duration:.2f} 秒")
+                                
+                                # 让用户选择切片方式
+                                use_custom_clip = st.checkbox(
+                                    f"使用自定义切片时间 - 素材{idx+1}",
+                                    key=f"use_custom_clip_{idx}",
+                                    value=False,
+                                    help="勾选后可以自定义开始和结束时间，不勾选则使用视频片段时长自动切片"
+                                )
+                                
+                                # 让用户选择是否使用原素材音频
+                                use_original_audio = st.checkbox(
+                                    f"使用原素材音频 - 素材{idx+1}",
+                                    key=f"use_original_audio_{idx}",
+                                    value=False,
+                                    help="勾选后将使用该素材的原始音频，否则使用生成的音频"
+                                )
+                                
+                                start_time = 0.0
+                                end_time = 0.0
+                                
+                                if use_custom_clip:
+                                    time_col1, time_col2 = st.columns(2)
+                                    with time_col1:
+                                        start_time = st.number_input(
+                                            f"开始时间 (秒) - 素材{idx+1}",
+                                            min_value=0.0,
+                                            max_value=total_duration,
+                                            value=0.0,
+                                            step=0.5,
+                                            key=f"start_{idx}"
+                                        )
+                                    with time_col2:
+                                        end_time = st.number_input(
+                                            f"结束时间 (秒) - 素材{idx+1}",
+                                            min_value=0.0,
+                                            max_value=total_duration,
+                                            value=total_duration,
+                                            step=0.5,
+                                            key=f"end_{idx}"
+                                        )
+                                    
+                                    # 验证结束时间必须大于开始时间
+                                    if end_time <= start_time:
+                                        st.warning(f"素材{idx+1}: 结束时间必须大于开始时间")
+                                        end_time = start_time + 1.0
+                                    
+                                    # 预览按钮
+                                    preview_clicked = st.button(f"预览片段 - 素材{idx+1}", key=f"preview_btn_{idx}")
+                                    
+                                    # 存储该素材的预览路径
+                                    material_preview_key = f"preview_path_{idx}"
+                                    
+                                    if preview_clicked:
+                                        try:
+                                            # 使用项目已有的 _open_video_clip_quietly 函数
+                                            from app.services.video import _open_video_clip_quietly
+                                            clip = _open_video_clip_quietly(file_path)
+                                            preview_clip = clip.subclipped(start_time, min(end_time, clip.duration))
+                                            
+                                            # 保存预览
+                                            preview_path = os.path.join(temp_material_dir, f"preview_{idx}.mp4")
+                                            preview_clip.write_videofile(preview_path, codec='libx264', audio_codec='aac', logger=None)
+                                            
+                                            # 关闭剪辑
+                                            from app.services.video import close_clip
+                                            close_clip(preview_clip)
+                                            close_clip(clip)
+                                            
+                                            # 保存预览路径到 session_state
+                                            st.session_state[material_preview_key] = preview_path
+                                            st.success("预览片段已生成")
+                                        except Exception as e:
+                                            st.error(f"生成预览失败: {e}")
+                                    
+                                    # 如果有预览路径，在左侧栏内显示预览视频 - 使用HTML确保位置正确
+                                    if st.session_state.get(material_preview_key):
+                                        st.markdown("### 预览片段")
+                                        import base64
+                                        try:
+                                            # 读取视频文件并编码为base64
+                                            with open(st.session_state[material_preview_key], "rb") as video_file:
+                                                video_bytes = video_file.read()
+                                                video_base64 = base64.b64encode(video_bytes).decode()
+                                            
+                                            # 使用HTML在左侧栏内显示视频
+                                            video_html = f"""
+                                            <div style="width:100%;margin:10px 0;">
+                                                <video controls style="width:100%;border-radius:8px;border:2px solid #ddd;">
+                                                    <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
+                                                    您的浏览器不支持视频播放
+                                                </video>
+                                            </div>
+                                            """
+                                            st.markdown(video_html, unsafe_allow_html=True)
+                                        except Exception as e:
+                                            st.warning(f"无法使用HTML显示视频，使用标准方式: {e}")
+                                            st.video(st.session_state[material_preview_key])
+                                
+                                material_configs.append({
+                                    'file': uploaded_file,
+                                    'path': file_path,
+                                    'start_time': start_time,
+                                    'end_time': end_time,
+                                    'use_custom_clip': use_custom_clip,
+                                    'use_original_audio': use_original_audio
+                                })
+                                
+                            except Exception as e:
+                                st.error(f"读取视频失败: {e}")
+                                material_configs.append({
+                                    'file': uploaded_file,
+                                    'path': file_path,
+                                    'start_time': 0.0,
+                                    'end_time': 0.0,
+                                    'use_custom_clip': False,
+                                    'use_original_audio': False
+                                })
+                        else:
+                            # 图片文件
+                            st.image(file_path, caption=f"素材 {idx+1} - {uploaded_file.name}", use_container_width=True)
+                            material_configs.append({
+                                'file': uploaded_file,
+                                'path': file_path,
+                                'start_time': 0.0,
+                                'end_time': 0.0,
+                                'use_custom_clip': False,
+                                'use_original_audio': False
+                            })
+                        
+                        st.markdown("---")
+                
+                # 保存配置到 session_state
+                st.session_state['material_configs'] = material_configs
         
         video_concat_mode = st.selectbox(
             "视频组合方式",
@@ -484,107 +658,117 @@ with col1:
     
     # 音频设置
     with st.expander("🎵 音频设置", expanded=False):
-        # 添加配音来源选项
-        voice_source = st.selectbox(
-            "配音来源",
-            options=["tts", "local"],
-            index=0,
-            format_func=lambda x: "AI配音" if x == "tts" else "上传配音"
+        # 添加是否启用配音的选项
+        voice_enabled = st.checkbox(
+            "启用配音",
+            value=False
         )
         
         custom_voice_files = None
         custom_voice_path = None
+        voice_name = ""
+        voice_volume = 1.0
+        voice_rate = 1.0
         
-        if voice_source == "tts":
-            voice_provider = st.selectbox(
-                "配音提供商",
-                options=["azure", "siliconflow", "gemini", "mimo"],
+        if voice_enabled:
+            # 添加配音来源选项
+            voice_source = st.selectbox(
+                "配音来源",
+                options=["tts", "local"],
                 index=0,
-                format_func=lambda x: {
-                    "azure": "Azure",
-                    "siliconflow": "硅基流动",
-                    "gemini": "Gemini",
-                    "mimo": "小米Mimo"
-                }[x]
+                format_func=lambda x: "AI配音" if x == "tts" else "上传配音"
             )
-        
-        # 根据配音来源处理
-        if voice_source == "tts":
-            # 根据提供商获取声音列表
-            if voice_provider == "azure":
-                voice_names = voice.get_all_azure_voices()
-            elif voice_provider == "siliconflow":
-                voice_names = voice.get_siliconflow_voices()
-            elif voice_provider == "gemini":
-                voice_names = voice.get_gemini_voices()
-            else:
-                voice_names = voice.get_mimo_voices()
             
-            if voice_names:
-                voice_name = st.selectbox(
-                    "配音声音",
-                    options=voice_names,
-                    index=0
+            if voice_source == "tts":
+                voice_provider = st.selectbox(
+                    "配音提供商",
+                    options=["azure", "siliconflow", "gemini", "mimo"],
+                    index=0,
+                    format_func=lambda x: {
+                        "azure": "Azure",
+                        "siliconflow": "硅基流动",
+                        "gemini": "Gemini",
+                        "mimo": "小米Mimo"
+                    }[x]
+                )
+            
+            # 根据配音来源处理
+            if voice_source == "tts":
+                # 根据提供商获取声音列表
+                if voice_provider == "azure":
+                    voice_names = voice.get_all_azure_voices()
+                elif voice_provider == "siliconflow":
+                    voice_names = voice.get_siliconflow_voices()
+                elif voice_provider == "gemini":
+                    voice_names = voice.get_gemini_voices()
+                else:
+                    voice_names = voice.get_mimo_voices()
+                
+                if voice_names:
+                    voice_name = st.selectbox(
+                        "配音声音",
+                        options=voice_names,
+                        index=0
+                    )
+                    
+                    # 试听按钮
+                    if st.button("🎧 试听配音", key="preview_voice"):
+                        try:
+                            with st.spinner("正在生成试听音频..."):
+                                test_text = video_script[:50] if video_script else "你好，这是一段测试音频，用来试听配音效果。"
+                                temp_voice_file = os.path.join("storage", "temp", f"preview_{uuid4()}.mp3")
+                                os.makedirs(os.path.dirname(temp_voice_file), exist_ok=True)
+                                
+                                voice.tts(
+                                    text=test_text,
+                                    voice_name=voice_name,
+                                    voice_file=temp_voice_file,
+                                    voice_rate=1.0,
+                                    voice_volume=1.0
+                                )
+                                
+                                st.audio(temp_voice_file, format="audio/mp3")
+                                st.success("✅ 试听音频生成成功！")
+                        except Exception as e:
+                            st.error(f"试听失败：{e}")
+                else:
+                    voice_name = ""
+                    st.warning("⚠️ 未找到可用的配音声音")
+                
+                voice_volume = st.slider(
+                    "配音音量",
+                    min_value=0.0,
+                    max_value=2.0,
+                    value=1.0,
+                    step=0.1
                 )
                 
-                # 试听按钮
-                if st.button("🎧 试听配音", key="preview_voice"):
-                    try:
-                        with st.spinner("正在生成试听音频..."):
-                            test_text = video_script[:50] if video_script else "你好，这是一段测试音频，用来试听配音效果。"
-                            temp_voice_file = os.path.join("storage", "temp", f"preview_{uuid4()}.mp3")
-                            os.makedirs(os.path.dirname(temp_voice_file), exist_ok=True)
-                            
-                            voice.tts(
-                                text=test_text,
-                                voice_name=voice_name,
-                                voice_file=temp_voice_file,
-                                voice_rate=1.0,
-                                voice_volume=1.0
-                            )
-                            
-                            st.audio(temp_voice_file, format="audio/mp3")
-                            st.success("✅ 试听音频生成成功！")
-                    except Exception as e:
-                        st.error(f"试听失败：{e}")
+                voice_rate = st.slider(
+                    "配音语速",
+                    min_value=0.5,
+                    max_value=2.0,
+                    value=1.0,
+                    step=0.1
+                )
             else:
+                # 上传配音
                 voice_name = ""
-                st.warning("⚠️ 未找到可用的配音声音")
-            
-            voice_volume = st.slider(
-                "配音音量",
-                min_value=0.0,
-                max_value=2.0,
-                value=1.0,
-                step=0.1
-            )
-            
-            voice_rate = st.slider(
-                "配音语速",
-                min_value=0.5,
-                max_value=2.0,
-                value=1.0,
-                step=0.1
-            )
-        else:
-            # 上传配音
-            voice_name = ""
-            voice_volume = 1.0
-            voice_rate = 1.0
-            custom_voice_files = st.file_uploader(
-                "上传配音音频文件（支持多个，按顺序拼接）",
-                type=["mp3", "wav", "flac", "m4a"],
-                accept_multiple_files=True
-            )
-            if custom_voice_files:
-                st.success(f"已上传 {len(custom_voice_files)} 个配音文件")
-                # 预览第一个音频
-                st.audio(custom_voice_files[0], format="audio/mp3")
+                voice_volume = 1.0
+                voice_rate = 1.0
+                custom_voice_files = st.file_uploader(
+                    "上传配音音频文件（支持多个，按顺序拼接）",
+                    type=["mp3", "wav", "flac", "m4a"],
+                    accept_multiple_files=True
+                )
+                if custom_voice_files:
+                    st.success(f"已上传 {len(custom_voice_files)} 个配音文件")
+                    # 预览第一个音频
+                    st.audio(custom_voice_files[0], format="audio/mp3")
         
         bgm_type = st.selectbox(
             "背景音乐类型",
             options=["random", "custom", "none"],
-            index=0,
+            index=2,
             format_func=lambda x: {
                 "random": "随机背景音乐",
                 "custom": "自定义背景音乐",
@@ -690,7 +874,7 @@ with col1:
                 "字体大小",
                 min_value=10,
                 max_value=200,
-                value=60
+                value=24
             )
             
             stroke_color = st.color_picker(
@@ -911,12 +1095,14 @@ with col1:
             custom_voice_path = None
             try:
                 if 'voice_source' in locals() and voice_source == "local" and custom_voice_files is not None and len(custom_voice_files) > 0:
-                    temp_voice_dir = os.path.join("storage", "temp", task_id)
+                    temp_voice_dir = utils.storage_dir(os.path.join("temp", task_id), create=True)
                     os.makedirs(temp_voice_dir, exist_ok=True)
                     
                     # 只保存第一个文件
                     uploaded_file = custom_voice_files[0]
                     file_path = os.path.join(temp_voice_dir, uploaded_file.name)
+                    # 确保使用绝对路径
+                    file_path = os.path.abspath(file_path)
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getvalue())
                     custom_voice_path = file_path
@@ -928,20 +1114,55 @@ with col1:
             # 处理本地素材上传
             video_materials = None
             if video_source == "local" and uploaded_files is not None:
-                temp_material_dir = os.path.join("storage", "temp", task_id)
+                # 使用 utils.storage_dir 获取绝对路径，确保跨平台兼容性
+                temp_material_dir = utils.storage_dir(os.path.join("temp", task_id), create=True)
                 os.makedirs(temp_material_dir, exist_ok=True)
                 video_materials = []
-                for uploaded_file in uploaded_files:
-                    file_path = os.path.join(temp_material_dir, uploaded_file.name)
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getvalue())
-                    # 创建MaterialInfo对象
-                    material_info = MaterialInfo(
-                        provider="local",
-                        url=file_path,
-                        duration=0
-                    )
-                    video_materials.append(material_info)
+                
+                # 使用 session_state 中的配置
+                material_configs = st.session_state.get('material_configs', [])
+                
+                if material_configs and len(material_configs) == len(uploaded_files):
+                    # 使用保存的配置
+                    for config in material_configs:
+                        uploaded_file = config['file']
+                        file_path = os.path.join(temp_material_dir, uploaded_file.name)
+                        # 确保使用绝对路径
+                        file_path = os.path.abspath(file_path)
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getvalue())
+                        # 创建MaterialInfo对象
+                        material_info = MaterialInfo(
+                            provider="local",
+                            url=file_path,
+                            duration=0,
+                            start_time=float(config.get('start_time', 0.0)),
+                            end_time=float(config.get('end_time', 0.0)),
+                            use_custom_clip=bool(config.get('use_custom_clip', False)),
+                            use_original_audio=bool(config.get('use_original_audio', False))
+                        )
+                        video_materials.append(material_info)
+                        st.session_state["log_records"].append(f"📁 素材已保存：{file_path}")
+                else:
+                    # 回退到默认处理
+                    for uploaded_file in uploaded_files:
+                        file_path = os.path.join(temp_material_dir, uploaded_file.name)
+                        # 确保使用绝对路径
+                        file_path = os.path.abspath(file_path)
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getvalue())
+                        # 创建MaterialInfo对象
+                        material_info = MaterialInfo(
+                            provider="local",
+                            url=file_path,
+                            duration=0,
+                            start_time=0.0,
+                            end_time=0.0,
+                            use_custom_clip=False,
+                            use_original_audio=False
+                        )
+                        video_materials.append(material_info)
+                        st.session_state["log_records"].append(f"📁 素材已保存：{file_path}")
             
             # 创建参数
             params = VideoParams(
@@ -997,6 +1218,15 @@ with col1:
                 
                 status_text.text("正在启动视频生成任务...")
                 st.session_state["log_records"].append("正在启动视频生成任务...")
+                
+                # 配置 loguru 临时 handler，将日志输出到 st.session_state
+                log_handler_id = None
+                def loguru_sink(message):
+                    record = message.record
+                    log_msg = f"[{record['level'].name}] {record['message']}"
+                    st.session_state["log_records"].append(log_msg)
+                
+                log_handler_id = logger.add(loguru_sink, level="DEBUG")
                 
                 progress_bar.progress(10)
                 
@@ -1092,10 +1322,23 @@ with col1:
                     st.error(f"任务执行失败：{e}")
                     st.session_state["log_records"].append(f"错误：{e}")
                     st.session_state["show_floating_progress"] = False
+                finally:
+                    # 移除临时 log handler
+                    if log_handler_id is not None:
+                        try:
+                            logger.remove(log_handler_id)
+                        except:
+                            pass
             
             except Exception as e:
                 st.error(f"任务启动失败：{e}")
                 st.session_state["show_floating_progress"] = False
+                # 确保移除 handler
+                if 'log_handler_id' in locals() and log_handler_id is not None:
+                    try:
+                        logger.remove(log_handler_id)
+                    except:
+                        pass
     
     # 日志显示区域
     st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)

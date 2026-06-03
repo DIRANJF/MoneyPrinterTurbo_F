@@ -164,16 +164,24 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
-        materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
-        )
-        if not materials:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error(
-                "no valid materials found, please check the materials and try again."
+        logger.info(f"params.video_materials before preprocess: {params.video_materials}")
+        try:
+            materials = video.preprocess_video(
+                materials=params.video_materials, clip_duration=params.video_clip_duration
             )
-            return None
-        return [material_info.url for material_info in materials]
+            logger.info(f"Materials after preprocess: {materials}")
+            if not materials:
+                sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+                logger.error(
+                    "no valid materials found, please check the materials and try again."
+                )
+                return None, None
+            # 对于本地素材，返回完整的 materials 列表而不是只返回 URL
+            return materials, "local_materials"
+        except Exception as e:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(f"Error in preprocess_video: {str(e)}", exc_info=True)
+            return None, None
     elif params.video_source == "solid_color":
         logger.info("\n\n## creating solid color background")
         # 创建纯色背景视频
@@ -197,8 +205,8 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         if not solid_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("failed to create solid color videos.")
-            return None
-        return solid_videos
+            return None, None
+        return solid_videos, "video_paths"
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         downloaded_videos = material.download_videos(
@@ -215,12 +223,12 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             logger.error(
                 "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
             )
-            return None
-        return downloaded_videos
+            return None, None
+        return downloaded_videos, "video_paths"
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path
+    task_id, params, downloaded_videos, audio_file, subtitle_path, materials_type="video_paths"
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -229,6 +237,12 @@ def generate_final_videos(
     )
     video_transition_mode = params.video_transition_mode
 
+    logger.info(f"Starting generate_final_videos, materials_type={materials_type}")
+    if materials_type == "local_materials":
+        logger.info(f"Number of local materials: {len(downloaded_videos)}")
+        for i, material in enumerate(downloaded_videos):
+            logger.info(f"Material {i+1}: url={material.url}, use_custom_clip={getattr(material, 'use_custom_clip', False)}, use_original_audio={getattr(material, 'use_original_audio', False)}")
+
     _progress = 50
     for i in range(params.video_count):
         index = i + 1
@@ -236,16 +250,52 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-        )
+        
+        # 检查是否有素材需要使用原音频
+        use_original_audio = False
+        if materials_type == "local_materials":
+            for material in downloaded_videos:
+                if getattr(material, "use_original_audio", False):
+                    use_original_audio = True
+                    logger.info(f"Found material with use_original_audio=True: {material.url}")
+                    break
+        
+        try:
+            if materials_type == "local_materials":
+                # 对于本地素材，传递完整的 materials 列表
+                # 如果使用原音频，不传 audio_file
+                video.combine_videos_with_materials(
+                    combined_video_path=combined_video_path,
+                    video_materials=downloaded_videos,
+                    audio_file=audio_file if not use_original_audio else None,
+                    video_aspect=params.video_aspect,
+                    video_concat_mode=video_concat_mode,
+                    video_transition_mode=video_transition_mode,
+                    max_clip_duration=params.video_clip_duration,
+                    threads=params.n_threads,
+                )
+            else:
+                # 原来的方式，传递视频路径列表
+                video.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=downloaded_videos,
+                    audio_file=audio_file,
+                    video_aspect=params.video_aspect,
+                    video_concat_mode=video_concat_mode,
+                    video_transition_mode=video_transition_mode,
+                    max_clip_duration=params.video_clip_duration,
+                    threads=params.n_threads,
+                )
+            
+            # 检查 combined 视频是否生成成功
+            if os.path.exists(combined_video_path):
+                file_size = os.path.getsize(combined_video_path)
+                logger.success(f"Combined video generated: {combined_video_path} ({file_size} bytes)")
+            else:
+                logger.error(f"Combined video not found: {combined_video_path}")
+        except Exception as e:
+            logger.error(f"Error combining videos: {str(e)}", exc_info=True)
+            raise
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
@@ -253,13 +303,28 @@ def generate_final_videos(
         final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
 
         logger.info(f"\n\n## generating video: {index} => {final_video_path}")
-        video.generate_video(
-            video_path=combined_video_path,
-            audio_path=audio_file,
-            subtitle_path=subtitle_path,
-            output_file=final_video_path,
-            params=params,
-        )
+        
+        # 如果使用原音频，audio_path 传 None
+        audio_path_to_use = audio_file if not use_original_audio else None
+        
+        try:
+            video.generate_video(
+                video_path=combined_video_path,
+                audio_path=audio_path_to_use,
+                subtitle_path=subtitle_path,
+                output_file=final_video_path,
+                params=params,
+            )
+            
+            # 检查 final 视频是否生成成功
+            if os.path.exists(final_video_path):
+                file_size = os.path.getsize(final_video_path)
+                logger.success(f"Final video generated: {final_video_path} ({file_size} bytes)")
+            else:
+                logger.error(f"Final video not found: {final_video_path}")
+        except Exception as e:
+            logger.error(f"Error generating video: {str(e)}", exc_info=True)
+            raise
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
@@ -267,18 +332,31 @@ def generate_final_videos(
         final_video_paths.append(final_video_path)
         combined_video_paths.append(combined_video_path)
 
+    logger.info(f"Generated {len(final_video_paths)} final videos: {final_video_paths}")
     return final_video_paths, combined_video_paths
 
 
 def start(task_id, params: VideoParams, stop_at: str = "video"):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     logger.info(f"params.custom_audio_file: {getattr(params, 'custom_audio_file', None)}")
+    logger.info(f"params.video_source: {params.video_source}")
+    logger.info(f"params.video_materials: {params.video_materials}")
+    logger.info(f"params.voice_name: {params.voice_name}")
+    logger.info(f"params.bgm_type: {params.bgm_type}")
+    
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
     # 1. Generate script
-    video_script = generate_script(task_id, params)
-    if not video_script or "Error: " in video_script:
+    try:
+        video_script = generate_script(task_id, params)
+        if not video_script or "Error: " in video_script:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(f"Failed to generate script: {video_script}")
+            return
+        logger.info(f"Generated script: {video_script}")
+    except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(f"Error generating script: {str(e)}", exc_info=True)
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
@@ -307,13 +385,32 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
-    # 3. Generate audio
-    audio_file, audio_duration, sub_maker = generate_audio(
-        task_id, params, video_script
-    )
-    if not audio_file:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        return
+    # 3. Generate audio (if voice_name is provided)
+    audio_file = None
+    audio_duration = 0
+    sub_maker = None
+    
+    # 检查是否有本地素材使用原音频，或者没有提供配音
+    has_original_audio_materials = False
+    if params.video_source == "local" and params.video_materials:
+        for material in params.video_materials:
+            if getattr(material, "use_original_audio", False):
+                has_original_audio_materials = True
+                break
+    
+    # 如果有原音频素材，或者没有提供配音名称，就不生成配音
+    if not has_original_audio_materials and params.voice_name:
+        audio_file, audio_duration, sub_maker = generate_audio(
+            task_id, params, video_script
+        )
+        if not audio_file:
+            # 如果尝试生成配音但失败了，仍然继续（使用素材音频）
+            logger.warning("Failed to generate audio, will use original material audio if available")
+            audio_file = None
+            audio_duration = 0
+            sub_maker = None
+    else:
+        logger.info("No voice name provided or using original material audio, skipping audio generation")
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
@@ -326,10 +423,12 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
-    # 4. Generate subtitle
-    subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
-    )
+    # 4. Generate subtitle (only if we have audio file and video script)
+    subtitle_path = None
+    if audio_file and video_script and params.subtitle_enabled:
+        subtitle_path = generate_subtitle(
+            task_id, params, video_script, sub_maker, audio_file
+        )
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -343,11 +442,19 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
-    )
-    if not downloaded_videos:
+    try:
+        downloaded_videos, materials_type = get_video_materials(
+            task_id, params, video_terms, audio_duration
+        )
+        logger.info(f"downloaded_videos: {downloaded_videos}")
+        logger.info(f"materials_type: {materials_type}")
+        if not downloaded_videos:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error("No downloaded videos found")
+            return
+    except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(f"Error getting video materials: {str(e)}", exc_info=True)
         return
 
     if stop_at == "materials":
@@ -367,12 +474,18 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths = generate_final_videos(
-        task_id, params, downloaded_videos, audio_file, subtitle_path
-    )
+    try:
+        final_video_paths, combined_video_paths = generate_final_videos(
+            task_id, params, downloaded_videos, audio_file, subtitle_path, materials_type
+        )
 
-    if not final_video_paths:
+        if not final_video_paths:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error("No video files generated!")
+            return
+    except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(f"Error generating final videos: {str(e)}", exc_info=True)
         return
 
     logger.success(

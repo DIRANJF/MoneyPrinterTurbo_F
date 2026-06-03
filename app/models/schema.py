@@ -53,15 +53,17 @@ class VideoAspect(str, Enum):
         return 1080, 1920
 
 
-class _Config:
-    arbitrary_types_allowed = True
-
-
-@pydantic.dataclasses.dataclass(config=_Config)
-class MaterialInfo:
+class MaterialInfo(BaseModel):
     provider: str = "pexels"
     url: str = ""
     duration: int = 0
+    start_time: float = 0.0  # 视频片段开始时间（秒）
+    end_time: float = 0.0    # 视频片段结束时间（秒），0 表示使用整个视频
+    use_custom_clip: bool = False  # 是否使用自定义切片，False 表示使用视频片段时长自动切片
+    use_original_audio: bool = False  # 是否使用原素材音频
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class VideoParams(BaseModel):
@@ -102,7 +104,7 @@ class VideoParams(BaseModel):
     voice_name: Optional[str] = ""
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.0
-    bgm_type: Optional[str] = "random"
+    bgm_type: Optional[str] = "none"
     bgm_file: Optional[str] = ""
     custom_bgm_file: Optional[str] = None  # Custom background music file path
     bgm_volume: Optional[float] = 0.2
@@ -115,7 +117,7 @@ class VideoParams(BaseModel):
     text_background_color: Union[bool, str] = True
     rounded_subtitle_background: bool = False
 
-    font_size: int = 60
+    font_size: int = 24
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
     n_threads: Optional[int] = 2
@@ -146,7 +148,7 @@ class SubtitleRequest(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = True
     rounded_subtitle_background: bool = False
-    font_size: int = 60
+    font_size: int = 24
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
     video_source: Optional[str] = "local"
