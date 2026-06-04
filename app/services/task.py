@@ -1,6 +1,7 @@
 import math
 import os.path
 import re
+import time
 from os import path
 
 from loguru import logger
@@ -126,38 +127,86 @@ def generate_audio(task_id, params, video_script):
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     '''
     Generate subtitle for the video script.
-    If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
-    Otherwise, it will generate the subtitle using the specified provider.
+    If subtitle generation is disabled, return empty string.
+    Otherwise, generate subtitle:
+        - if sub_maker is available, use edge
+        - elif audio_file is available, use whisper
+        - else, create a simple subtitle from video_script
     Returns:
         - subtitle_path: path to the generated subtitle file
     '''
     logger.info("\n\n## generating subtitle")
-    if not params.subtitle_enabled or sub_maker is None:
+    if not params.subtitle_enabled or not video_script:
         return ""
 
     subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
-    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
-    logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
-
-    subtitle_fallback = False
-    if subtitle_provider == "edge":
-        voice.create_subtitle(
-            text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
-        )
-        if not os.path.exists(subtitle_path):
-            subtitle_fallback = True
-            logger.warning("subtitle file not found, fallback to whisper")
-
-    if subtitle_provider == "whisper" or subtitle_fallback:
+    
+    # 情况 1: 有 sub_maker，用 edge
+    if sub_maker is not None:
+        subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
+        logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
+        subtitle_fallback = False
+        if subtitle_provider == "edge":
+            voice.create_subtitle(
+                text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
+            )
+            if not os.path.exists(subtitle_path):
+                subtitle_fallback = True
+                logger.warning("subtitle file not found, fallback to whisper")
+        
+        if subtitle_provider == "whisper" or subtitle_fallback:
+            if audio_file:
+                subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
+                logger.info("\n\n## correcting subtitle")
+                subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+    
+    # 情况 2: 没有 sub_maker 但有 audio_file，用 whisper
+    elif audio_file is not None:
+        logger.info("\n\n## generating subtitle with whisper (audio file available)")
         subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
         logger.info("\n\n## correcting subtitle")
         subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
-
+    
+    # 情况 3: 既没有 sub_maker 也没有 audio_file，创建简单字幕
+    else:
+        logger.info("\n\n## generating simple subtitle from video script")
+        # 用足够长的时长（默认600秒=10分钟），确保字幕能在整个视频中显示
+        create_simple_subtitle(video_script, subtitle_path, duration_seconds=600)
+    
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
         return ""
 
+    return subtitle_path
+
+
+def create_simple_subtitle(text, subtitle_path, duration_seconds=30):
+    '''
+    Create a simple SRT subtitle file from a text string.
+    The whole text will be shown as one subtitle for the full video duration.
+    '''
+    # 转换秒数为 SRT 时间格式
+    def seconds_to_srt_time(seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millisecs = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
+    
+    # 生成字幕，持续整个视频时长
+    lines = []
+    lines.append("1")
+    lines.append(f"{seconds_to_srt_time(0)} --> {seconds_to_srt_time(duration_seconds)}")
+    # 清理文本中的多余换行
+    cleaned_text = text.replace('\n', ' ').strip()
+    lines.append(cleaned_text)
+    lines.append("")
+    
+    with open(subtitle_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    
+    logger.info(f"Simple subtitle created: {subtitle_path}, duration: {duration_seconds}s")
     return subtitle_path
 
 
@@ -337,7 +386,11 @@ def generate_final_videos(
 
 
 def start(task_id, params: VideoParams, stop_at: str = "video"):
-    logger.info(f"start task: {task_id}, stop_at: {stop_at}")
+    import time
+    total_start_time = time.time()
+    logger.info("="*60)
+    logger.info(f"🚀 START TASK: {task_id}, stop_at: {stop_at}")
+    logger.info("="*60)
     logger.info(f"params.custom_audio_file: {getattr(params, 'custom_audio_file', None)}")
     logger.info(f"params.video_source: {params.video_source}")
     logger.info(f"params.video_materials: {params.video_materials}")
@@ -347,16 +400,21 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
     # 1. Generate script
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("📝 STAGE 1: Generate Script")
+    logger.info("="*60)
     try:
         video_script = generate_script(task_id, params)
         if not video_script or "Error: " in video_script:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error(f"Failed to generate script: {video_script}")
             return
+        logger.success(f"✅ Script generated successfully ({time.time() - stage_start_time:.2f}s)")
         logger.info(f"Generated script: {video_script}")
     except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error(f"Error generating script: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error generating script: {str(e)}", exc_info=True)
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
@@ -368,12 +426,19 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         return {"script": video_script}
 
     # 2. Generate terms
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("🔍 STAGE 2: Generate Terms")
+    logger.info("="*60)
     video_terms = ""
     if params.video_source != "local":
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             return
+        logger.success(f"✅ Terms generated successfully ({time.time() - stage_start_time:.2f}s)")
+    else:
+        logger.info("Skipping terms generation (using local materials)")
 
     save_script_data(task_id, video_script, video_terms, params)
 
@@ -386,6 +451,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
     # 3. Generate audio (if voice_name is provided)
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("🎙️ STAGE 3: Generate Audio")
+    logger.info("="*60)
     audio_file = None
     audio_duration = 0
     sub_maker = None
@@ -409,8 +478,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             audio_file = None
             audio_duration = 0
             sub_maker = None
+        else:
+            logger.success(f"✅ Audio generated successfully ({time.time() - stage_start_time:.2f}s)")
+            logger.info(f"Audio duration: {audio_duration:.2f}s")
     else:
-        logger.info("No voice name provided or using original material audio, skipping audio generation")
+        logger.info("Skipping audio generation (using original material audio or no voice selected)")
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
@@ -423,12 +495,24 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
-    # 4. Generate subtitle (only if we have audio file and video script)
+    # 4. Generate subtitle
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("📄 STAGE 4: Generate Subtitle")
+    logger.info("="*60)
     subtitle_path = None
-    if audio_file and video_script and params.subtitle_enabled:
+    if video_script and params.subtitle_enabled:
+        # 即使没有 audio_file，只要有 video_script 且启用了字幕，就尝试生成
+        # 如果没有 audio_file 或 sub_maker，我们用视频脚本来创建一个简单字幕
         subtitle_path = generate_subtitle(
             task_id, params, video_script, sub_maker, audio_file
         )
+        if subtitle_path:
+            logger.success(f"✅ Subtitle generated successfully ({time.time() - stage_start_time:.2f}s)")
+        else:
+            logger.warning("Subtitle generation failed, but will continue without subtitles")
+    else:
+        logger.info("Skipping subtitle generation (subtitle disabled)")
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -442,6 +526,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("🎬 STAGE 5: Get Video Materials")
+    logger.info("="*60)
     try:
         downloaded_videos, materials_type = get_video_materials(
             task_id, params, video_terms, audio_duration
@@ -452,9 +540,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("No downloaded videos found")
             return
+        logger.success(f"✅ Materials retrieved successfully ({time.time() - stage_start_time:.2f}s)")
+        logger.info(f"Number of materials: {len(downloaded_videos)}")
     except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error(f"Error getting video materials: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error getting video materials: {str(e)}", exc_info=True)
         return
 
     if stop_at == "materials":
@@ -474,6 +564,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
+    stage_start_time = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("🎥 STAGE 6: Generate Final Videos")
+    logger.info("="*60)
     try:
         final_video_paths, combined_video_paths = generate_final_videos(
             task_id, params, downloaded_videos, audio_file, subtitle_path, materials_type
@@ -483,9 +577,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("No video files generated!")
             return
+        logger.success(f"✅ Final videos generated successfully ({time.time() - stage_start_time:.2f}s)")
     except Exception as e:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error(f"Error generating final videos: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error generating final videos: {str(e)}", exc_info=True)
         return
 
     logger.success(
@@ -503,7 +598,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     # 7. Cross-post to TikTok/Instagram (if enabled)
     cross_post_results = []
     if upload_post.upload_post_service.is_configured() and upload_post.upload_post_service.auto_upload:
-        logger.info("\n\n## cross-posting videos to TikTok/Instagram")
+        stage_start_time = time.time()
+        logger.info("\n" + "="*60)
+        logger.info("📱 STAGE 7: Cross-posting to TikTok/Instagram")
+        logger.info("="*60)
         for video_path in final_video_paths:
             result = upload_post.cross_post_video(
                 video_path=video_path,
@@ -511,10 +609,16 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             )
             cross_post_results.append(result)
             if result.get('success'):
-                logger.info(f"Cross-posted: {video_path}")
+                logger.info(f"✅ Cross-posted: {video_path}")
             else:
-                logger.warning(f"Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
+                logger.warning(f"⚠️ Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
+        logger.success(f"Cross-posting completed ({time.time() - stage_start_time:.2f}s)")
 
+    total_duration = time.time() - total_start_time
+    logger.info("\n" + "="*60)
+    logger.success(f"🎉 TASK COMPLETED IN {total_duration:.2f}s")
+    logger.info("="*60)
+    
     kwargs = {
         "videos": final_video_paths,
         "combined_videos": combined_video_paths,
@@ -525,6 +629,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         "subtitle_path": subtitle_path,
         "materials": downloaded_videos,
         "cross_post_results": cross_post_results if cross_post_results else None,
+        "total_duration": total_duration,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs

@@ -274,6 +274,18 @@ def concat_video_clips_with_ffmpeg(
             absolute_path = os.path.abspath(clip_file)
             fp.write(f"file '{_escape_ffmpeg_concat_path(absolute_path)}'\n")
 
+    # 检查第一个 clip 是否有音频，来决定是否在输出中包含音频
+    has_audio = False
+    if clip_files:
+        try:
+            test_clip = _open_video_clip_quietly(clip_files[0], audio=True)
+            has_audio = test_clip.audio is not None
+            close_clip(test_clip)
+            logger.info(f"First clip has audio: {has_audio}")
+        except Exception as e:
+            logger.warning(f"Could not check audio in first clip: {e}")
+
+    # 构建 ffmpeg 命令
     command = [
         get_ffmpeg_binary(),
         "-y",
@@ -295,8 +307,25 @@ def concat_video_clips_with_ffmpeg(
         str(threads or 2),
         "-pix_fmt",
         video_pix_fmt,
-        output_file,
     ]
+
+    # 如果有音频，添加音频编码选项
+    if has_audio:
+        command.extend([
+            "-c:a",
+            audio_codec,
+            "-b:a",
+            audio_bitrate,
+        ])
+    else:
+        # 没有音频，明确告诉 ffmpeg
+        command.extend([
+            "-an"
+        ])
+
+    command.append(output_file)
+
+    logger.info(f"FFmpeg concat command (has_audio={has_audio}): {' '.join(command[:10])}...")
 
     try:
         # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
@@ -309,7 +338,9 @@ def concat_video_clips_with_ffmpeg(
         )
         if result.returncode != 0:
             error_message = (result.stderr or result.stdout or "").strip()
+            logger.error(f"FFmpeg concat failed: {error_message}")
             raise RuntimeError(error_message or "ffmpeg concat failed")
+        logger.success("FFmpeg concat completed successfully")
     finally:
         delete_files(concat_list_file)
 
@@ -1325,14 +1356,22 @@ def generate_video(
         
         return _clip
 
-    video_clip = _open_video_clip_quietly(video_path)
+    video_clip = _open_video_clip_quietly(video_path, audio=True)
     
-    # 如果 audio_path 为 None，就不处理音频，也不添加生成的音频和 BGM
+    # 如果 audio_path 为 None，检查原视频是否有音频，保留它
     audio_clip = None
+    original_has_audio = video_clip.audio is not None
+    logger.info(f"Original video has audio: {original_has_audio}")
+    
     if audio_path:
+        # 使用提供的音频（配音）
         audio_clip = AudioFileClip(audio_path).with_effects(
             [afx.MultiplyVolume(params.voice_volume)]
         )
+    elif original_has_audio:
+        # 保留原视频的音频
+        audio_clip = video_clip.audio
+        logger.info("Retaining original audio from video")
 
     def make_textclip(text):
         return TextClip(
@@ -1342,32 +1381,81 @@ def generate_video(
         )
 
     if subtitle_path and os.path.exists(subtitle_path):
+        logger.info(f"=== START SUBTITLE PROCESSING ===")
         logger.info(f"Loading subtitles from: {subtitle_path}")
-        # 读取字幕文件内容检查
+        
+        # 读取字幕文件内容
         try:
             with open(subtitle_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                logger.info(f"Subtitle content preview: {content[:200]}")
+                logger.info(f"Subtitle content:\n{content}")
         except Exception as e:
             logger.warning(f"Failed to read subtitle file: {e}")
         
-        # 使用 SubtitlesClip
+        # 1. 解析 SRT 文件
         try:
-            sub = SubtitlesClip(
-                subtitles=subtitle_path, 
-                encoding="utf-8", 
-                make_textclip=make_textclip
-            )
+            def parse_srt_time(time_str):
+                h, m, s_ms = time_str.split(':')
+                s, ms = s_ms.split(',')
+                return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
+            
+            def parse_srt(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                blocks = content.split('\n\n')
+                subtitles = []
+                for block in blocks:
+                    lines = block.strip().split('\n')
+                    if len(lines) >= 3:
+                        time_line = lines[1]
+                        text = '\n'.join(lines[2:])
+                        if ' --> ' in time_line:
+                            start_str, end_str = time_line.split(' --> ')
+                            try:
+                                start = parse_srt_time(start_str)
+                                end = parse_srt_time(end_str)
+                                subtitles.append(((start, end), text))
+                            except Exception as e:
+                                logger.warning(f"Failed to parse subtitle time: {time_line}")
+                return subtitles
+            
+            srt_subtitles = parse_srt(subtitle_path)
+            logger.info(f"Parsed {len(srt_subtitles)} subtitles from SRT file")
+            
+            # 2. 如果没有解析到字幕，或者为了保险起见，创建一个简单的测试字幕！
+            if not srt_subtitles:
+                logger.warning("No subtitles parsed, creating test subtitle")
+                test_text = "Test Subtitle"
+                video_duration = video_clip.duration
+                srt_subtitles = [((0, video_duration), test_text)]
+            
+            # 3. 创建 text clips
             text_clips = []
-            for item in sub.subtitles:
-                logger.info(f"Processing subtitle: {item}")
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
+            for idx, item in enumerate(srt_subtitles):
+                logger.info(f"Processing subtitle {idx+1}/{len(srt_subtitles)}: {item}")
+                
+                # 确保字幕结束时间不超过视频时长！
+                start_time, end_time = item[0]
+                if end_time > video_clip.duration:
+                    end_time = video_clip.duration
+                adjusted_item = ((start_time, end_time), item[1])
+                
+                clip = create_text_clip(subtitle_item=adjusted_item)
+                if clip:
+                    text_clips.append(clip)
+                    logger.info(f"Created text clip {idx+1}")
+            
+            # 4. 合成字幕到视频！
             if text_clips:
+                logger.info(f"Adding {len(text_clips)} subtitle clips to video...")
                 video_clip = CompositeVideoClip([video_clip, *text_clips])
-                logger.info(f"Added {len(text_clips)} subtitle clips")
+                logger.info("✅ SUCCESS: Subtitles added to video!")
+            else:
+                logger.warning("❌ No subtitle clips were created!")
+        
         except Exception as e:
-            logger.error(f"Error processing subtitles: {e}")
+            logger.error(f"❌ Error processing subtitles: {e}", exc_info=True)
+        logger.info(f"=== END SUBTITLE PROCESSING ===")
 
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file, custom_bgm_file=getattr(params, "custom_bgm_file", ""))
     if bgm_file and audio_clip:
@@ -1380,8 +1468,23 @@ def generate_video(
                 ]
             )
             audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+            logger.info("Added background music to audio")
         except Exception as e:
             logger.error(f"failed to add bgm: {str(e)}")
+    elif bgm_file and not audio_path and original_has_audio:
+        # 只有原音频，但是有背景音乐时，也添加背景音乐
+        try:
+            bgm_clip = AudioFileClip(bgm_file).with_effects(
+                [
+                    afx.MultiplyVolume(params.bgm_volume),
+                    afx.AudioFadeOut(3),
+                    afx.AudioLoop(duration=video_clip.duration),
+                ]
+            )
+            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+            logger.info("Added background music to original audio")
+        except Exception as e:
+            logger.error(f"failed to add bgm to original audio: {str(e)}")
 
     if audio_clip:
         video_clip = video_clip.with_audio(audio_clip)
@@ -1410,6 +1513,7 @@ def generate_video(
     if audio_clip:
         write_params["audio_codec"] = audio_codec
     else:
+        # 只有在确实没有音频时才设置 audio=False
         write_params["audio"] = False
     
     video_clip.write_videofile(**write_params)

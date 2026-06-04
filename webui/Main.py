@@ -1062,8 +1062,32 @@ with col1:
     # 生成按钮
     st.markdown("<hr>", unsafe_allow_html=True)
     
-    # 生成按钮
-    if st.button("🚀 生成视频", key="gen_video", type="primary"):
+    # 初始化计时器状态
+    if "timer_start_time" not in st.session_state:
+        st.session_state["timer_start_time"] = None
+    if "timer_running" not in st.session_state:
+        st.session_state["timer_running"] = False
+    if "last_timer_display" not in st.session_state:
+        st.session_state["last_timer_display"] = 0.0
+    
+    # 计时器容器 - 始终在同一个位置
+    timer_display = st.empty()
+    
+    # 先渲染计时器（基于当前状态）
+    if st.session_state["timer_running"] and st.session_state["timer_start_time"] is not None:
+        import time
+        elapsed = time.time() - st.session_state["timer_start_time"]
+        st.session_state["last_timer_display"] = elapsed
+        timer_html = f'<div style="text-align:center;font-size:1.5rem;font-weight:bold;color:#4CAF50;padding:10px;background:#f0f9f0;border-radius:8px;margin-bottom:10px;">⏱️ {elapsed:.1f}s</div>'
+        timer_display.markdown(timer_html, unsafe_allow_html=True)
+    else:
+        display_time = st.session_state["last_timer_display"] if st.session_state["last_timer_display"] > 0 else 0.0
+        timer_html = f'<div style="text-align:center;font-size:1.5rem;font-weight:bold;color:#2196F3;padding:10px;background:#E3F2FD;border-radius:8px;margin-bottom:10px;">⏱️ {display_time:.1f}s</div>'
+        timer_display.markdown(timer_html, unsafe_allow_html=True)
+    
+    gen_button_clicked = st.button("🚀 生成视频", key="gen_video", type="primary")
+    
+    if gen_button_clicked:
             if not video_subject and not video_script:
                 st.error("请填写视频主题或视频脚本")
                 st.stop()
@@ -1071,6 +1095,11 @@ with col1:
             if not video_terms and video_source in ["pexels", "pixabay"]:
                 st.error("请先生成视频关键词")
                 st.stop()
+            
+            # 启动计时器
+            import time
+            st.session_state["timer_start_time"] = time.time()
+            st.session_state["timer_running"] = True
             
             task_id = str(uuid4())
             st.session_state["current_task_id"] = task_id
@@ -1211,6 +1240,11 @@ with col1:
                 params.video_crf = custom_crf
             
             # 启动任务
+            import time
+            import threading
+            # 任务结果容器（使用列表，避免 nonlocal 问题）
+            task_result = [None]
+            task_error = [None]
             try:
                 # 使用一个简单的进度条
                 progress_bar = st.progress(0)
@@ -1230,110 +1264,145 @@ with col1:
                 
                 progress_bar.progress(10)
                 
-                # 实际执行任务 - tm.start() 是同步执行的，会完整执行所有步骤
-                try:
-                    result = tm.start(task_id=task_id, params=params)
-                    st.session_state["log_records"].append(f"任务执行中，任务ID：{task_id}")
-                    st.session_state["log_records"].append(f"任务返回结果：{result}")
-                    if result:
-                        for key, value in result.items():
-                            st.session_state["log_records"].append(f"  - {key}: {value}")
-                    
-                    progress_bar.progress(100)
-                    status_text.text("视频生成完成！")
-                    st.session_state["log_records"].append("视频生成完成！")
-                    
-                    # 从返回结果中获取视频路径
-                    video_found = False
+                # 任务完成事件
+                task_done = threading.Event()
+                
+                # 线程函数：执行任务
+                def run_task():
                     try:
-                        if result and "videos" in result and len(result["videos"]) > 0:
-                            video_path = result["videos"][0]
-                            st.session_state["log_records"].append(f"尝试使用返回的视频路径：{video_path}")
-                            st.session_state["log_records"].append(f"  - 是否存在：{os.path.exists(video_path)}")
-                            
-                            # 尝试标准化路径
-                            normalized_path = os.path.abspath(os.path.normpath(video_path))
-                            st.session_state["log_records"].append(f"  - 标准化路径：{normalized_path}")
-                            
-                            if os.path.exists(normalized_path):
-                                st.session_state["generated_video_path"] = normalized_path
-                                st.success("视频生成完成！")
-                                st.session_state["log_records"].append(f"视频文件：{normalized_path}")
-                                video_found = True
-                                # 添加到历史记录
-                                if normalized_path not in st.session_state["video_history"]:
-                                    st.session_state["video_history"].append(normalized_path)
-                            else:
-                                st.session_state["log_records"].append(f"返回的视频文件不存在，尝试其他方式查找")
+                        task_result[0] = tm.start(task_id=task_id, params=params)
                     except Exception as e:
-                        st.session_state["log_records"].append(f"处理返回结果时出错：{e}")
-                    
-                    # 如果没找到，在任务目录中查找
-                    if not video_found:
-                        try:
-                            task_dir = os.path.join(root_dir, "storage", "tasks", task_id)
-                            task_dir = os.path.abspath(os.path.normpath(task_dir))
-                            st.session_state["log_records"].append(f"尝试查找任务目录：{task_dir}")
-                            
-                            if os.path.exists(task_dir):
-                                task_contents = os.listdir(task_dir)
-                                st.session_state["log_records"].append(f"任务目录内容：{task_contents}")
-                                
-                                # 查找所有 mp4 文件
-                                video_files = []
-                                for f in task_contents:
-                                    if f.endswith(".mp4"):
-                                        full_path = os.path.join(task_dir, f)
-                                        size = os.path.getsize(full_path)
-                                        st.session_state["log_records"].append(f"  - 发现文件：{f} ({size} bytes)")
-                                        video_files.append((f, size))
-                                
-                                # 优先找带 final 的
-                                final_videos = [f for f in video_files if "final" in f[0]]
-                                if final_videos:
-                                    # 选最大的那个
-                                    final_videos.sort(key=lambda x: x[1], reverse=True)
-                                    video_path = os.path.join(task_dir, final_videos[0][0])
-                                elif video_files:
-                                    # 选最大的那个
-                                    video_files.sort(key=lambda x: x[1], reverse=True)
-                                    video_path = os.path.join(task_dir, video_files[0][0])
-                                else:
-                                    video_path = None
-                                
-                                if video_path and os.path.exists(video_path):
-                                    st.session_state["generated_video_path"] = video_path
-                                    st.success("视频生成完成！")
-                                    st.session_state["log_records"].append(f"找到视频文件：{video_path}")
-                                    # 添加到历史记录
-                                    if video_path not in st.session_state["video_history"]:
-                                        st.session_state["video_history"].append(video_path)
-                                else:
-                                    st.warning("任务已完成，但未找到视频文件")
-                                    st.session_state["log_records"].append("未找到视频文件")
-                            else:
-                                st.warning("任务已完成，但任务目录不存在")
-                                st.session_state["log_records"].append(f"任务目录不存在：{task_dir}")
-                        except Exception as e:
-                            st.session_state["log_records"].append(f"查找视频文件时出错：{e}")
-                            st.error(f"查找视频文件时出错：{e}")
-                    
+                        task_error[0] = e
+                    finally:
+                        task_done.set()
+                
+                # 启动任务线程
+                task_thread = threading.Thread(target=run_task)
+                task_thread.start()
+                
+                # 实时更新计时器显示！
+                while not task_done.is_set():
+                    if st.session_state["timer_start_time"] is not None:
+                        elapsed = time.time() - st.session_state["timer_start_time"]
+                        # 更新 session state
+                        st.session_state["last_timer_display"] = elapsed
+                        # 实时更新计时器 UI！
+                        timer_html = f'<div style="text-align:center;font-size:1.5rem;font-weight:bold;color:#4CAF50;padding:10px;background:#f0f9f0;border-radius:8px;margin-bottom:10px;">⏱️ {elapsed:.1f}s</div>'
+                        timer_display.markdown(timer_html, unsafe_allow_html=True)
+                    # 稍微睡一下，避免占用太多 CPU
+                    time.sleep(0.2)
+                
+                # 等待任务线程完成
+                task_thread.join()
+                
+                # 处理任务结果
+                result = task_result[0]
+                if task_error[0]:
+                    raise task_error[0]
+                
+                st.session_state["log_records"].append(f"任务执行中，任务ID：{task_id}")
+                st.session_state["log_records"].append(f"任务返回结果：{result}")
+                if result:
+                    for key, value in result.items():
+                        st.session_state["log_records"].append(f"  - {key}: {value}")
+                
+                progress_bar.progress(100)
+                status_text.text("视频生成完成！")
+                st.session_state["log_records"].append("视频生成完成！")
+                
+                # 任务完成，计算并保存最终时间
+                if st.session_state["timer_start_time"] is not None:
+                    final_elapsed = time.time() - st.session_state["timer_start_time"]
+                    st.session_state["last_timer_display"] = final_elapsed
+                    st.session_state["timer_running"] = False
+                    # 更新计时器显示为最终完成状态
+                    timer_html = f'<div style="text-align:center;font-size:1.5rem;font-weight:bold;color:#2196F3;padding:10px;background:#E3F2FD;border-radius:8px;margin-bottom:10px;">⏱️ {final_elapsed:.1f}s</div>'
+                    timer_display.markdown(timer_html, unsafe_allow_html=True)
+                
+                # 从返回结果中获取视频路径
+                video_found = False
+                try:
+                    if result and "videos" in result and len(result["videos"]) > 0:
+                        video_path = result["videos"][0]
+                        st.session_state["log_records"].append(f"尝试使用返回的视频路径：{video_path}")
+                        st.session_state["log_records"].append(f"  - 是否存在：{os.path.exists(video_path)}")
+                        
+                        # 尝试标准化路径
+                        normalized_path = os.path.abspath(os.path.normpath(video_path))
+                        st.session_state["log_records"].append(f"  - 标准化路径：{normalized_path}")
+                        
+                        if os.path.exists(normalized_path):
+                            st.session_state["generated_video_path"] = normalized_path
+                            st.success("视频生成完成！")
+                            st.session_state["log_records"].append(f"视频文件：{normalized_path}")
+                            video_found = True
+                            # 添加到历史记录
+                            if normalized_path not in st.session_state["video_history"]:
+                                st.session_state["video_history"].append(normalized_path)
+                        else:
+                            st.session_state["log_records"].append(f"返回的视频文件不存在，尝试其他方式查找")
                 except Exception as e:
-                    st.error(f"任务执行失败：{e}")
-                    st.session_state["log_records"].append(f"错误：{e}")
-                    st.session_state["show_floating_progress"] = False
-                finally:
-                    # 移除临时 log handler
-                    if log_handler_id is not None:
-                        try:
-                            logger.remove(log_handler_id)
-                        except:
-                            pass
-            
+                    st.session_state["log_records"].append(f"处理返回结果时出错：{e}")
+                
+                # 如果没找到，在任务目录中查找
+                if not video_found:
+                    try:
+                        task_dir = os.path.join(root_dir, "storage", "tasks", task_id)
+                        task_dir = os.path.abspath(os.path.normpath(task_dir))
+                        st.session_state["log_records"].append(f"尝试查找任务目录：{task_dir}")
+                        
+                        if os.path.exists(task_dir):
+                            task_contents = os.listdir(task_dir)
+                            st.session_state["log_records"].append(f"任务目录内容：{task_contents}")
+                            
+                            # 查找所有 mp4 文件
+                            video_files = []
+                            for f in task_contents:
+                                if f.endswith(".mp4"):
+                                    full_path = os.path.join(task_dir, f)
+                                    size = os.path.getsize(full_path)
+                                    st.session_state["log_records"].append(f"  - 发现文件：{f} ({size} bytes)")
+                                    video_files.append((f, size))
+                            
+                            # 优先找带 final 的
+                            final_videos = [f for f in video_files if "final" in f[0]]
+                            if final_videos:
+                                # 选最大的那个
+                                final_videos.sort(key=lambda x: x[1], reverse=True)
+                                video_path = os.path.join(task_dir, final_videos[0][0])
+                            elif video_files:
+                                # 选最大的那个
+                                video_files.sort(key=lambda x: x[1], reverse=True)
+                                video_path = os.path.join(task_dir, video_files[0][0])
+                            else:
+                                video_path = None
+                            
+                            if video_path and os.path.exists(video_path):
+                                st.session_state["generated_video_path"] = video_path
+                                st.success("视频生成完成！")
+                                st.session_state["log_records"].append(f"找到视频文件：{video_path}")
+                                # 添加到历史记录
+                                if video_path not in st.session_state["video_history"]:
+                                    st.session_state["video_history"].append(video_path)
+                            else:
+                                st.warning("任务已完成，但未找到视频文件")
+                                st.session_state["log_records"].append("未找到视频文件")
+                        else:
+                            st.warning("任务已完成，但任务目录不存在")
+                            st.session_state["log_records"].append(f"任务目录不存在：{task_dir}")
+                    except Exception as e:
+                        st.session_state["log_records"].append(f"查找视频文件时出错：{e}")
+                        st.error(f"查找视频文件时出错：{e}")
             except Exception as e:
-                st.error(f"任务启动失败：{e}")
+                st.error(f"任务执行失败：{e}")
+                st.session_state["log_records"].append(f"错误：{e}")
                 st.session_state["show_floating_progress"] = False
-                # 确保移除 handler
+                # 停止计时器
+                st.session_state["timer_running"] = False
+            finally:
+                # 确保计时器停止
+                st.session_state["timer_running"] = False
+                # 移除临时 log handler
                 if 'log_handler_id' in locals() and log_handler_id is not None:
                     try:
                         logger.remove(log_handler_id)
