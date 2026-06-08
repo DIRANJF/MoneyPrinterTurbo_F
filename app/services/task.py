@@ -316,7 +316,7 @@ def generate_final_videos(
                 video.combine_videos_with_materials(
                     combined_video_path=combined_video_path,
                     video_materials=downloaded_videos,
-                    audio_file=audio_file if not use_original_audio else None,
+                    audio_file=audio_file,
                     video_aspect=params.video_aspect,
                     video_concat_mode=video_concat_mode,
                     video_transition_mode=video_transition_mode,
@@ -354,7 +354,7 @@ def generate_final_videos(
         logger.info(f"\n\n## generating video: {index} => {final_video_path}")
         
         # 如果使用原音频，audio_path 传 None
-        audio_path_to_use = audio_file if not use_original_audio else None
+        audio_path_to_use = audio_file
         
         try:
             video.generate_video(
@@ -460,15 +460,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sub_maker = None
     
     # 检查是否有本地素材使用原音频，或者没有提供配音
-    has_original_audio_materials = False
-    if params.video_source == "local" and params.video_materials:
-        for material in params.video_materials:
-            if getattr(material, "use_original_audio", False):
-                has_original_audio_materials = True
-                break
-    
+    custom_audio_file = getattr(params, "custom_audio_file", None)
+    should_generate_audio = bool(params.voice_name or custom_audio_file)
+
     # 如果有原音频素材，或者没有提供配音名称，就不生成配音
-    if not has_original_audio_materials and params.voice_name:
+    if should_generate_audio:
         audio_file, audio_duration, sub_maker = generate_audio(
             task_id, params, video_script
         )
@@ -482,7 +478,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
             logger.success(f"✅ Audio generated successfully ({time.time() - stage_start_time:.2f}s)")
             logger.info(f"Audio duration: {audio_duration:.2f}s")
     else:
-        logger.info("Skipping audio generation (using original material audio or no voice selected)")
+        logger.info("Skipping audio generation (no voice-over selected)")
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 

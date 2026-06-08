@@ -45,6 +45,25 @@ class TestTaskService(unittest.TestCase):
             custom_system_prompt="Only write short narration.",
         )
     
+    def test_custom_audio_file_is_used_without_voice_name(self):
+        params = VideoParams(
+            video_subject="local voice",
+            video_script="script",
+            voice_name="",
+            custom_audio_file="voice.mp3",
+        )
+
+        with patch.object(tm.os.path, "exists", return_value=True), patch.object(
+            tm.voice, "get_audio_duration", return_value=3.2
+        ):
+            audio_file, audio_duration, sub_maker = tm.generate_audio(
+                "task-id", params, "script"
+            )
+
+        self.assertEqual(audio_file, "voice.mp3")
+        self.assertEqual(audio_duration, 3.2)
+        self.assertIsNone(sub_maker)
+
     def test_task_local_materials(self):
         task_id = "00000000-0000-0000-0000-000000000000"
         video_materials=[]

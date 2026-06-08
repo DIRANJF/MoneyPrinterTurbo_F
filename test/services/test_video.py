@@ -399,5 +399,53 @@ class TestVideoService(unittest.TestCase):
         finally:
             clip.close()
 
+    def test_generate_video_mixes_original_audio_and_voiceover(self):
+        class _FakeVideoClip:
+            def __init__(self):
+                self.audio = "original-audio"
+                self.duration = 5
+
+            def with_audio(self, audio):
+                self.audio = audio
+                return self
+
+            def write_videofile(self, **kwargs):
+                self.write_params = kwargs
+
+            def close(self):
+                pass
+
+        class _FakeVoiceClip:
+            fps = 44100
+
+            def with_effects(self, effects):
+                return self
+
+        class _FakeCompositeAudioClip:
+            fps = 44100
+
+            def __init__(self, clips):
+                self.clips = clips
+
+        fake_video_clip = _FakeVideoClip()
+        params = vd.VideoParams(video_subject="test", video_script="test")
+        params.subtitle_enabled = False
+        params.bgm_type = "none"
+
+        with patch.object(vd, "_open_video_clip_quietly", return_value=fake_video_clip), patch.object(
+            vd, "AudioFileClip", return_value=_FakeVoiceClip()
+        ), patch.object(vd, "CompositeAudioClip", _FakeCompositeAudioClip):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        self.assertIsInstance(fake_video_clip.audio, _FakeCompositeAudioClip)
+        self.assertEqual(fake_video_clip.audio.clips[0], "original-audio")
+        self.assertIsInstance(fake_video_clip.audio.clips[1], _FakeVoiceClip)
+
 if __name__ == "__main__":
     unittest.main() 

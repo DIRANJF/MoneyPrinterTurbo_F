@@ -12,6 +12,7 @@ from loguru import logger
 import numpy as np
 from moviepy import (
     AudioFileClip,
+    AudioClip,
     ColorClip,
     CompositeAudioClip,
     CompositeVideoClip,
@@ -72,6 +73,18 @@ video_crf = 23  # CRF 值越小画质越好，范围 0-51，推荐 18-28
 video_preset = "slow"  # 编码预设，越慢画质越好（ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow）
 video_pix_fmt = "yuv420p"  # 像素格式，保证兼容性
 _BGM_EXTENSIONS = (".mp3",)
+
+
+def _silent_audio_clip(duration: float, fps_value: int = 44100) -> AudioClip:
+    duration = max(0.01, float(duration or 0.01))
+
+    def make_frame(t):
+        values = np.asarray(t)
+        if values.ndim == 0:
+            return np.array([0.0, 0.0])
+        return np.zeros((len(values), 2))
+
+    return AudioClip(make_frame, duration=duration, fps=fps_value)
 
 # 视频质量预设配置
 VIDEO_QUALITY_PRESETS = {
@@ -276,14 +289,17 @@ def concat_video_clips_with_ffmpeg(
 
     # 检查第一个 clip 是否有音频，来决定是否在输出中包含音频
     has_audio = False
-    if clip_files:
+    for clip_file in clip_files:
         try:
-            test_clip = _open_video_clip_quietly(clip_files[0], audio=True)
-            has_audio = test_clip.audio is not None
+            test_clip = _open_video_clip_quietly(clip_file, audio=True)
+            if test_clip.audio is not None:
+                has_audio = True
+                close_clip(test_clip)
+                break
             close_clip(test_clip)
-            logger.info(f"First clip has audio: {has_audio}")
         except Exception as e:
-            logger.warning(f"Could not check audio in first clip: {e}")
+            logger.warning(f"Could not check audio in clip {clip_file}: {e}")
+    logger.info(f"Concat clips have audio: {has_audio}")
 
     # 构建 ffmpeg 命令
     command = [
@@ -547,6 +563,7 @@ def combine_videos_with_materials(
                 clip_duration = clip.duration
                 close_clip(clip)
                 # 如果使用自定义切片，使用自定义时长
+                material_duration = float(getattr(material, "duration", 0) or 0)
                 if getattr(material, "use_custom_clip", False):
                     start_time = material.start_time
                     end_time = material.end_time
@@ -554,6 +571,8 @@ def combine_videos_with_materials(
                         audio_duration += (end_time - start_time)
                     else:
                         audio_duration += clip_duration
+                elif material_duration > 0:
+                    audio_duration += min(material_duration, clip_duration)
                 else:
                     audio_duration += clip_duration
             logger.info(f"audio duration calculated from materials: {audio_duration} seconds")
@@ -581,6 +600,7 @@ def combine_videos_with_materials(
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
+        material_duration = float(getattr(material, "duration", 0) or 0)
         
         # 保存素材的 use_original_audio 信息
         material_audio_info[video_path] = getattr(material, "use_original_audio", False)
@@ -615,6 +635,8 @@ def combine_videos_with_materials(
             )
         else:
             # 使用视频片段时长自动切片
+            if material_duration > 0:
+                clip_duration = min(clip_duration, material_duration)
             current_start = 0
             while current_start < clip_duration:
                 current_end = min(current_start + max_clip_duration, clip_duration)
@@ -710,6 +732,15 @@ def combine_videos_with_materials(
 
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
+
+            source_file = subclipped_item.source_file_path
+            use_audio = material_audio_info.get(source_file, False)
+            if has_original_audio:
+                if use_audio and clip.audio is None:
+                    logger.warning(f"material requested original audio but clip has none: {source_file}")
+                    clip = clip.with_audio(_silent_audio_clip(clip.duration))
+                elif not use_audio:
+                    clip = clip.with_audio(_silent_audio_clip(clip.duration))
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
@@ -726,11 +757,11 @@ def combine_videos_with_materials(
             }
             
             # 如果是 combine_videos_with_materials 函数且有 material_audio_info
-            if 'material_audio_info' in locals():
-                source_file = subclipped_item.source_file_path
-                use_audio = material_audio_info.get(source_file, False)
-                if not use_audio:
-                    write_params["audio"] = False
+            if clip.audio is not None:
+                write_params["audio_codec"] = audio_codec
+                write_params["audio_bitrate"] = audio_bitrate
+            else:
+                write_params["audio"] = False
             
             clip.write_videofile(**write_params)
 
@@ -798,13 +829,14 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
-    audio_clip = AudioFileClip(audio_file)
+    audio_clip = AudioFileClip(audio_file) if audio_file else None
     try:
         # 这里只需要读取旁白音频时长来决定素材视频拼接长度；后续不会再使用
         # audio_clip。读取完成后立即关闭，避免早退或异常路径泄漏文件句柄。
-        audio_duration = audio_clip.duration
+        audio_duration = audio_clip.duration if audio_clip else 0
     finally:
-        close_clip(audio_clip)
+        if audio_clip:
+            close_clip(audio_clip)
     logger.info(f"audio duration: {audio_duration} seconds")
     logger.info(f"maximum clip duration: {max_clip_duration} seconds")
 
@@ -1359,18 +1391,23 @@ def generate_video(
     video_clip = _open_video_clip_quietly(video_path, audio=True)
     
     # 如果 audio_path 为 None，检查原视频是否有音频，保留它
-    audio_clip = None
+    audio_tracks = []
     original_has_audio = video_clip.audio is not None
     logger.info(f"Original video has audio: {original_has_audio}")
     
     if audio_path:
         # 使用提供的音频（配音）
-        audio_clip = AudioFileClip(audio_path).with_effects(
+        voice_audio_clip = AudioFileClip(audio_path).with_effects(
             [afx.MultiplyVolume(params.voice_volume)]
         )
+        audio_tracks.append(voice_audio_clip)
+        logger.info("Added voice-over audio to mix")
+    if original_has_audio and audio_path:
+        audio_tracks.insert(0, video_clip.audio)
+        logger.info("Retaining original audio from video")
     elif original_has_audio:
         # 保留原视频的音频
-        audio_clip = video_clip.audio
+        audio_tracks.append(video_clip.audio)
         logger.info("Retaining original audio from video")
 
     def make_textclip(text):
@@ -1458,7 +1495,7 @@ def generate_video(
         logger.info(f"=== END SUBTITLE PROCESSING ===")
 
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file, custom_bgm_file=getattr(params, "custom_bgm_file", ""))
-    if bgm_file and audio_clip:
+    if bgm_file:
         try:
             bgm_clip = AudioFileClip(bgm_file).with_effects(
                 [
@@ -1467,24 +1504,15 @@ def generate_video(
                     afx.AudioLoop(duration=video_clip.duration),
                 ]
             )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-            logger.info("Added background music to audio")
+            audio_tracks.append(bgm_clip)
+            logger.info("Added background music to mix")
         except Exception as e:
             logger.error(f"failed to add bgm: {str(e)}")
-    elif bgm_file and not audio_path and original_has_audio:
-        # 只有原音频，但是有背景音乐时，也添加背景音乐
-        try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
-            )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-            logger.info("Added background music to original audio")
-        except Exception as e:
-            logger.error(f"failed to add bgm to original audio: {str(e)}")
+    audio_clip = None
+    if len(audio_tracks) == 1:
+        audio_clip = audio_tracks[0]
+    elif len(audio_tracks) > 1:
+        audio_clip = CompositeAudioClip(audio_tracks)
 
     if audio_clip:
         video_clip = video_clip.with_audio(audio_clip)
