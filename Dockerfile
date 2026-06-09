@@ -1,5 +1,5 @@
 # Use an official Python runtime as a parent image
-FROM docker.mirrors.ustc.edu.cn/library/python:3.11-slim-bullseye
+FROM python:3.11-slim-bullseye
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
