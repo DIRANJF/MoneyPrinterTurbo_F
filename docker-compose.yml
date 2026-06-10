@@ -12,6 +12,8 @@ services:
     command: [ "streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False" ]
     volumes: *common-volumes
     restart: always
+    networks:
+      - moneyprinterturbo-net
   api:
     build:
       context: .
@@ -22,3 +24,13 @@ services:
     command: [ "python3", "main.py" ]
     volumes: *common-volumes
     restart: always
+    networks:
+      - moneyprinterturbo-net
+
+networks:
+  moneyprinterturbo-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/16
+          gateway: 172.26.0.1

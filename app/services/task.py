@@ -615,6 +615,20 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     logger.success(f"🎉 TASK COMPLETED IN {total_duration:.2f}s")
     logger.info("="*60)
     
+    # 8. 清理临时素材（任务完成后立即清理上传的临时素材
+    logger.info("\n" + "="*60)
+    logger.info("🧹 STAGE 8: Cleanup Temporary Materials")
+    logger.info("="*60)
+    try:
+        utils.cleanup_temp_materials(task_id)
+        # 顺便清理一些临时目录中过期的文件
+        utils.cleanup_temp_directory()
+        # 清理超过24小时的旧任务
+        utils.cleanup_old_tasks(max_age_hours=24)
+        logger.success("✅ 清理完成")
+    except Exception as e:
+        logger.warning(f"⚠️ 清理临时素材时出错: {e}")
+    
     kwargs = {
         "videos": final_video_paths,
         "combined_videos": combined_video_paths,

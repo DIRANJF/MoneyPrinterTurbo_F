@@ -272,3 +272,88 @@ def load_locales(i18n_dir):
 
 def parse_extension(filename):
     return Path(filename).suffix.lower().lstrip('.')
+
+
+def cleanup_temp_materials(task_id):
+    """清理任务的临时素材文件"""
+    import shutil
+    try:
+        temp_material_dir = storage_dir(os.path.join("temp", task_id))
+        if os.path.exists(temp_material_dir):
+            shutil.rmtree(temp_material_dir, ignore_errors=True)
+            logger.info(f"🧹 清理临时素材目录: {temp_material_dir}")
+            return True
+    except Exception as e:
+        logger.warning(f"⚠️ 清理临时素材失败: {e}")
+    return False
+
+
+def cleanup_old_tasks(max_age_hours=24):
+    """定期清理旧任务目录，默认清理24小时前的任务"""
+    import shutil
+    import time
+    try:
+        tasks_root = task_dir()
+        if not os.path.exists(tasks_root):
+            return []
+        
+        now = time.time()
+        max_age_seconds = max_age_hours * 3600
+        deleted_tasks = []
+        
+        for task_id in os.listdir(tasks_root):
+            task_path = os.path.join(tasks_root, task_id)
+            if not os.path.isdir(task_path):
+                continue
+            try:
+                mtime = os.path.getmtime(task_path)
+                age = now - mtime
+                if age > max_age_seconds:
+                    shutil.rmtree(task_path, ignore_errors=True)
+                    deleted_tasks.append(task_id)
+                    logger.info(f"🧹 清理旧任务目录: {task_id} (age: {age/3600:.1f}h)")
+            except Exception as e:
+                logger.warning(f"⚠️ 清理任务 {task_id} 失败: {e}")
+        
+        if deleted_tasks:
+            logger.success(f"✅ 共清理 {len(deleted_tasks)} 个旧任务目录")
+        return deleted_tasks
+    except Exception as e:
+        logger.error(f"❌ 清理旧任务失败: {e}")
+        return []
+
+
+def cleanup_temp_directory():
+    """清理整个 temp 目录中的过期文件"""
+    import shutil
+    import time
+    try:
+        temp_root = storage_dir("temp")
+        if not os.path.exists(temp_root):
+            return 0
+        
+        now = time.time()
+        max_age_seconds = 12 * 3600  # 12小时
+        deleted_count = 0
+        
+        for item in os.listdir(temp_root):
+            item_path = os.path.join(temp_root, item)
+            try:
+                mtime = os.path.getmtime(item_path)
+                age = now - mtime
+                if age > max_age_seconds:
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
+                    else:
+                        os.remove(item_path)
+                    deleted_count += 1
+                    logger.debug(f"🧹 清理临时文件: {item} (age: {age/3600:.1f}h)")
+            except Exception as e:
+                logger.debug(f"⚠️ 清理临时文件 {item} 失败: {e}")
+        
+        if deleted_count > 0:
+            logger.info(f"🧹 清理了 {deleted_count} 个临时文件/目录")
+        return deleted_count
+    except Exception as e:
+        logger.error(f"❌ 清理临时目录失败: {e}")
+        return 0

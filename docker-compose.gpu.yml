@@ -9,11 +9,14 @@
 # This file overrides the default docker-compose.yml to:
 #   - Build with Dockerfile.gpu (NVIDIA CUDA base image)
 #   - Attach GPU device to the api service
+#   - Use custom network (172.20.0.0/16) to avoid conflicts with 172.19.0.0/16
 services:
   webui:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    networks:
+      - moneyprinterturbo-net
   api:
     build:
       context: .
@@ -25,3 +28,13 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    networks:
+      - moneyprinterturbo-net
+
+networks:
+  moneyprinterturbo-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/16
+          gateway: 172.26.0.1
