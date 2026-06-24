@@ -605,7 +605,7 @@ with col1:
         video_clip_duration = st.slider(
             "视频片段时长（秒）",
             min_value=1,
-            max_value=20,
+            max_value=60,
             value=5
         )
         
@@ -865,10 +865,24 @@ with col1:
                 value="#ffffff"
             )
             
-            text_background_color = st.color_picker(
-                "字幕背景色",
-                value="#000000"
+            # 字幕背景色设置，支持透明无背景
+            bg_color_option = st.selectbox(
+                "字幕背景",
+                options=["solid", "transparent"],
+                index=0,
+                format_func=lambda x: {
+                    "solid": "纯色背景",
+                    "transparent": "透明无背景"
+                }[x]
             )
+            
+            if bg_color_option == "solid":
+                text_background_color = st.color_picker(
+                    "字幕背景色",
+                    value="#000000"
+                )
+            else:
+                text_background_color = ""
             
             font_size = st.number_input(
                 "字体大小",

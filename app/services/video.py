@@ -1176,8 +1176,13 @@ def generate_video(
         # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
         # 也可能是实际颜色字符串。统一在这里归一化，避免把 True/False
         # 直接传给 TextClip 后出现不可预期的渲染结果。
+        # 空字符串表示透明无背景
         if isinstance(params.text_background_color, bool):
             return "#000000" if params.text_background_color else None
+        if isinstance(params.text_background_color, str):
+            # 空字符串或空白表示透明无背景
+            if not params.text_background_color or params.text_background_color.strip() == "":
+                return None
         return params.text_background_color
 
     def create_text_clip(subtitle_item):
