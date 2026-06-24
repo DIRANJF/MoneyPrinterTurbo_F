@@ -944,7 +944,8 @@ with col1:
                 llm_api_key = st.text_input(
                     "API Key",
                     value=llm_api_key,
-                    type="password"
+                    type="password",
+                    key=f"llm_api_key_{llm_provider}"
                 )
                 if llm_api_key:
                     config.app[f"{llm_provider}_api_key"] = llm_api_key
@@ -953,21 +954,24 @@ with col1:
                     llm_secret_key = st.text_input(
                         "Secret Key",
                         value=llm_secret_key,
-                        type="password"
+                        type="password",
+                        key=f"llm_secret_key_{llm_provider}"
                     )
                     if llm_secret_key:
                         config.app[f"{llm_provider}_secret_key"] = llm_secret_key
                 
                 llm_base_url = st.text_input(
                     "Base URL（可选）",
-                    value=llm_base_url
+                    value=llm_base_url,
+                    key=f"llm_base_url_{llm_provider}"
                 )
                 if llm_base_url:
                     config.app[f"{llm_provider}_base_url"] = llm_base_url
                 
                 llm_model_name = st.text_input(
                     "Model Name（可选）",
-                    value=llm_model_name
+                    value=llm_model_name,
+                    key=f"llm_model_name_{llm_provider}"
                 )
                 if llm_model_name:
                     config.app[f"{llm_provider}_model_name"] = llm_model_name
@@ -1006,7 +1010,8 @@ with col1:
                 tts_api_key = st.text_input(
                     "API Key",
                     value=tts_api_key,
-                    type="password"
+                    type="password",
+                    key=f"tts_api_key_{tts_provider}"
                 )
                 if tts_api_key:
                     config.app[f"{tts_provider}_api_key"] = tts_api_key
@@ -1015,21 +1020,24 @@ with col1:
                     tts_secret_key = st.text_input(
                         "Secret Key",
                         value=tts_secret_key,
-                        type="password"
+                        type="password",
+                        key=f"tts_secret_key_{tts_provider}"
                     )
                     if tts_secret_key:
                         config.app[f"{tts_provider}_secret_key"] = tts_secret_key
                 
                 tts_base_url = st.text_input(
                     "Base URL（可选）",
-                    value=tts_base_url
+                    value=tts_base_url,
+                    key=f"tts_base_url_{tts_provider}"
                 )
                 if tts_base_url:
                     config.app[f"{tts_provider}_base_url"] = tts_base_url
                 
                 tts_model_name = st.text_input(
                     "Model Name（可选）",
-                    value=tts_model_name
+                    value=tts_model_name,
+                    key=f"tts_model_name_{tts_provider}"
                 )
                 if tts_model_name:
                     config.app[f"{tts_provider}_model_name"] = tts_model_name
