@@ -13,7 +13,7 @@ services:
     volumes: *common-volumes
     restart: always
     networks:
-      - moneyprinterturbo-net
+      - docker_ssrf_proxy_network
   api:
     build:
       context: .
@@ -25,12 +25,8 @@ services:
     volumes: *common-volumes
     restart: always
     networks:
-      - moneyprinterturbo-net
+      - docker_ssrf_proxy_network
 
 networks:
-  moneyprinterturbo-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.26.0.0/16
-          gateway: 172.26.0.1
+  docker_ssrf_proxy_network:
+    external: true
